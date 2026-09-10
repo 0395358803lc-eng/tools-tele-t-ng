@@ -1,0 +1,44 @@
+name: Import screened source
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and verify screened source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 2 \
+            -o /tmp/source.tar.gz \
+            "https://39390c3c-5beb-43ad-98bc-4844037d429c-00-2dpiruj039f4k.pike.replit.dev/project-source-export.tar.gz"
+          echo "0eeb42eebead14706bf30f1fc9d4abf18606140bf33cfabfa0d4b9cec7fed0ae  /tmp/source.tar.gz" | sha256sum -c -
+
+      - name: Materialize project source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/project
+          tar -xzf /tmp/source.tar.gz -C /tmp/project
+          rsync -a --delete --exclude='.git/' /tmp/project/ ./
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to import"
+            exit 0
+          fi
+          git commit -m "Import complete Multi TG Manager project"
+          git push origin HEAD:main
