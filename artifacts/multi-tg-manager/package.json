@@ -1,0 +1,15 @@
+{
+  "name": "@workspace/multi-tg-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "cd frontend && npm ci && npm run build && cd ../backend && uv run --project ../../.. python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}",
+    "build": "cd frontend && npm ci && npm run build",
+    "serve": "cd backend && uv run --project ../../.. python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}",
+    "test": "cd backend && uv run --project ../../.. python -m unittest discover -s tests -v",
+    "lint": "cd backend && uv run --project ../../.. ruff check app tests alembic migrate.py --select E,F,I --ignore E501",
+    "migrate": "cd backend && bash ../ops/migrate.sh",
+    "typecheck": "cd frontend && npm run build"
+  }
+}

@@ -1,0 +1,917 @@
+import asyncio
+import json
+import re
+from urllib.parse import parse_qs, urlparse
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from telethon.errors import FloodWaitError
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.contacts import ResolvePhoneRequest
+from telethon.tl.functions.messages import (
+    GetAvailableReactionsRequest,
+    GetCustomEmojiDocumentsRequest,
+    GetMessagesViewsRequest,
+    SendReactionRequest,
+    StartBotRequest,
+)
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    ChatReactionsNone,
+    ChatReactionsSome,
+    DocumentAttributeCustomEmoji,
+    ReactionCustomEmoji,
+    ReactionEmoji,
+    User,
+)
+
+from ..config import settings
+from ..db import get_db
+from ..models import Account
+from ..recipient_files import Recipient, parse_recipient_file
+from ..schemas import (
+    AllowedCustomReaction,
+    AllowedReactionsIn,
+    AllowedReactionsOut,
+    BulkMessageIn,
+    BulkWipeChatIn,
+    ChatSendIn,
+    OpenChatIn,
+    ReactIn,
+    SendMessageIn,
+    TargetUsageCheckIn,
+    ViewPostIn,
+)
+from ..tg_manager import manager
+from ..utils import bulk_stream, friendly_error, jitter_delay
+
+router = APIRouter(prefix="/api/messaging", tags=["messaging"])
+
+
+def _reaction_obj(emoji: str | None, custom_emoji_id: int | None):
+    """Build a Telethon reaction object: custom emoji if an id is given, else standard."""
+    if custom_emoji_id:
+        return ReactionCustomEmoji(document_id=int(custom_emoji_id))
+    return ReactionEmoji(emoticon=emoji)
+
+
+def _parse_post_link(link: str) -> tuple[str, int]:
+    # supports t.me/<username>/<id> and https://t.me/c/<channel_id>/<id>
+    s = link.strip().replace("https://", "").replace("http://", "")
+    if s.startswith("t.me/"):
+        parts = s[5:].split("/")
+        if len(parts) >= 2 and parts[0] == "c" and len(parts) >= 3:
+            return parts[1], int(parts[2])  # numeric channel id
+        if len(parts) >= 2:
+            return parts[0], int(parts[1])
+    raise ValueError("Invalid post link")
+
+
+async def _accounts_named(
+    db: AsyncSession, ids: list[int]
+) -> list[tuple[int, str, str]]:
+    # Preserve the sender order chosen in the UI so round-robin recipient
+    # assignment is deterministic across runs.
+    res = await db.execute(select(Account).where(Account.id.in_(ids)))
+    by_id = {a.id: a for a in res.scalars().all()}
+    out: list[tuple[int, str, str]] = []
+    seen: set[int] = set()
+    for aid in ids:
+        if aid in seen or aid not in by_id:
+            continue
+        seen.add(aid)
+        a = by_id[aid]
+        out.append(
+            (
+                a.id,
+                a.phone,
+                (f"{a.first_name or ''} {a.last_name or ''}".strip() or a.phone),
+            )
+        )
+    return out
+
+
+async def _all_accounts_named(db: AsyncSession) -> list[tuple[int, str, str]]:
+    res = await db.execute(
+        select(Account).where(Account.status != "banned").order_by(Account.id)
+    )
+    return [
+        (
+            a.id,
+            a.phone,
+            (f"{a.first_name or ''} {a.last_name or ''}".strip() or a.phone),
+        )
+        for a in res.scalars().all()
+    ]
+
+
+@router.post("/{account_id}/send")
+async def send_message(account_id: int, body: SendMessageIn):
+    cli = manager.get(account_id)
+    if not cli:
+        raise HTTPException(409, "Account not connected")
+    try:
+        await cli.send_message(body.target, body.text)
+    except Exception as e:
+        raise HTTPException(400, friendly_error(e))
+    return {"ok": True}
+
+
+@router.post("/bulk_send")
+async def bulk_send(body: BulkMessageIn, db: AsyncSession = Depends(get_db)):
+    accounts = await _accounts_named(db, body.account_ids)
+    target, text = body.target, body.text
+
+    async def _send(cli, aid):
+        await cli.send_message(target, text)
+        return "ok", ""
+
+    return StreamingResponse(
+        bulk_stream(accounts, _send), media_type="application/x-ndjson"
+    )
+
+
+def _parse_sender_ids(raw: str) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            aid = int(part)
+        except ValueError as exc:
+            raise HTTPException(400, "Danh sách tài khoản gửi không hợp lệ") from exc
+        if aid > 0 and aid not in seen:
+            seen.add(aid)
+            out.append(aid)
+    if not out:
+        raise HTTPException(400, "Hãy chọn ít nhất một tài khoản gửi")
+    return out
+
+
+async def _read_recipient_upload(file: UploadFile) -> dict:
+    filename = file.filename or ""
+    data = await file.read(settings.MAX_RECIPIENT_UPLOAD_BYTES + 1)
+    if len(data) > settings.MAX_RECIPIENT_UPLOAD_BYTES:
+        limit_mb = settings.MAX_RECIPIENT_UPLOAD_BYTES // (1024 * 1024)
+        raise HTTPException(413, f"Tệp danh sách vượt quá giới hạn {limit_mb} MB")
+    if not data:
+        raise HTTPException(400, "Tệp danh sách đang trống")
+    try:
+        return await asyncio.to_thread(
+            parse_recipient_file, filename, data, settings.MAX_RECIPIENTS_PER_FILE
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, "Không thể đọc tệp danh sách người nhận") from exc
+
+
+@router.post("/recipient_list_preview")
+async def recipient_list_preview(file: UploadFile = File(...)):
+    parsed = await _read_recipient_upload(file)
+    recipients: list[Recipient] = parsed["recipients"]
+    return {
+        "filename": file.filename or "",
+        "valid": parsed["valid"],
+        "phones": parsed["phones"],
+        "usernames": parsed["usernames"],
+        "duplicates": parsed["duplicates"],
+        "invalid": parsed["invalid"],
+        "rows": parsed["rows"],
+        "sample": [
+            {"value": item.value, "kind": item.kind} for item in recipients[:20]
+        ],
+    }
+
+
+async def _resolve_recipient(cli, recipient: Recipient):
+    if recipient.kind == "username":
+        return await cli.get_entity(recipient.value.lstrip("@"))
+    phone = recipient.value.lstrip("+")
+    resolved = await cli(ResolvePhoneRequest(phone=phone))
+    users = list(getattr(resolved, "users", None) or [])
+    if not users:
+        raise RuntimeError("Không tìm thấy tài khoản Telegram theo số điện thoại này")
+    peer = getattr(resolved, "peer", None)
+    peer_user_id = getattr(peer, "user_id", None)
+    if peer_user_id is not None:
+        for user in users:
+            if getattr(user, "id", None) == peer_user_id:
+                return user
+    return users[0]
+
+
+async def _send_recipient(cli, recipient: Recipient, text: str) -> None:
+    entity = await _resolve_recipient(cli, recipient)
+    await cli.send_message(entity, text)
+
+
+def _balanced_recipient_assignments(
+    accounts: list[tuple[int, str, str]], recipients: list[Recipient]
+) -> dict[int, list[Recipient]]:
+    """Assign every recipient exactly once with queue sizes differing by at most one."""
+    assignments = {aid: [] for aid, _phone, _name in accounts}
+    if not accounts:
+        return assignments
+    for idx, recipient in enumerate(recipients):
+        assignments[accounts[idx % len(accounts)][0]].append(recipient)
+    return assignments
+
+
+def _recipient_delay_window(delay_min: float | None, delay_max: float | None) -> tuple[float, float]:
+    lo = settings.RECIPIENT_SEND_DELAY_MIN if delay_min is None else float(delay_min)
+    hi = settings.RECIPIENT_SEND_DELAY_MAX if delay_max is None else float(delay_max)
+    if lo < 0 or hi < 0 or lo > 3600 or hi > 3600:
+        raise HTTPException(400, "Thời gian nghỉ phải nằm trong khoảng 0 đến 3600 giây")
+    if hi < lo:
+        raise HTTPException(400, "Thời gian nghỉ tối đa phải lớn hơn hoặc bằng tối thiểu")
+    return lo, hi
+
+
+async def _recipient_list_stream(
+    accounts: list[tuple[int, str, str]],
+    recipients: list[Recipient],
+    text: str,
+    delay_min: float,
+    delay_max: float,
+):
+    # Only connected accounts participate. Recipients are assigned round-robin
+    # in sender-selection order; each sender processes its own queue sequentially.
+    active = [row for row in accounts if manager.get(row[0]) is not None]
+    total = len(recipients)
+    if not active:
+        yield json.dumps(
+            {
+                "type": "done",
+                "total": total,
+                "success": 0,
+                "failed": 0,
+                "skipped": total,
+                "pending": 0,
+                "partial": 0,
+                "results": [],
+            }
+        ) + "\n"
+        return
+
+    assignments = _balanced_recipient_assignments(active, recipients)
+
+    send_sem = asyncio.Semaphore(min(len(active), max(1, int(settings.CONCURRENCY))))
+    out_q: asyncio.Queue = asyncio.Queue()
+    success = failed = skipped = 0
+    results: list[dict] = []
+
+    async def emit(aid: int, sender_phone: str, sender_name: str, recipient: Recipient, status: str, detail: str):
+        await out_q.put(
+            {
+                "id": aid,
+                "phone": sender_phone,
+                "name": f"{sender_name} → {recipient.value}",
+                "status": status,
+                "detail": detail,
+                "recipient": recipient.value,
+                "recipient_kind": recipient.kind,
+            }
+        )
+
+    async def worker(aid: int, sender_phone: str, sender_name: str):
+        queue = assignments[aid]
+        cli = manager.get(aid)
+        if cli is None:
+            for recipient in queue:
+                await emit(aid, sender_phone, sender_name, recipient, "skipped", "Tài khoản gửi chưa kết nối")
+            return
+        for pos, recipient in enumerate(queue):
+            try:
+                async with send_sem:
+                    try:
+                        await asyncio.wait_for(
+                            _send_recipient(cli, recipient, text),
+                            timeout=max(10.0, float(settings.ACTION_TIMEOUT)),
+                        )
+                    except FloodWaitError as fw:
+                        if fw.seconds <= 30:
+                            await asyncio.sleep(fw.seconds + 1)
+                            await asyncio.wait_for(
+                                _send_recipient(cli, recipient, text),
+                                timeout=max(10.0, float(settings.ACTION_TIMEOUT)),
+                            )
+                        else:
+                            raise
+                await emit(aid, sender_phone, sender_name, recipient, "ok", f"Đã gửi tới {recipient.value}")
+            except FloodWaitError as fw:
+                await emit(
+                    aid, sender_phone, sender_name, recipient, "failed",
+                    f"Telegram yêu cầu chờ {fw.seconds} giây; đã dừng hàng đợi của tài khoản này",
+                )
+                for rest in queue[pos + 1:]:
+                    await emit(
+                        aid, sender_phone, sender_name, rest, "skipped",
+                        f"Bỏ qua do tài khoản đang bị giới hạn {fw.seconds} giây",
+                    )
+                break
+            except Exception as exc:
+                await emit(aid, sender_phone, sender_name, recipient, "failed", friendly_error(exc))
+            if pos < len(queue) - 1:
+                await jitter_delay(delay_min, delay_max)
+
+    tasks = [asyncio.create_task(worker(*row)) for row in active]
+    try:
+        for current in range(1, total + 1):
+            row = await out_q.get()
+            status = row["status"]
+            if status == "ok":
+                success += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+            results.append(row)
+            yield json.dumps(
+                {
+                    "type": "progress",
+                    "current": current,
+                    "total": total,
+                    "account_name": row["name"],
+                    "status": status,
+                    "detail": row["detail"],
+                    "success": success,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "pending": 0,
+                    "partial": 0,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+    finally:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    yield json.dumps(
+        {
+            "type": "done",
+            "total": total,
+            "success": success,
+            "failed": failed,
+            "skipped": skipped,
+            "pending": 0,
+            "partial": 0,
+            "results": results,
+        },
+        ensure_ascii=False,
+    ) + "\n"
+
+
+@router.post("/recipient_list_send")
+async def recipient_list_send(
+    account_ids: str = Form(...),
+    text: str = Form(...),
+    delay_min: float | None = Form(None),
+    delay_max: float | None = Form(None),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    sender_ids = _parse_sender_ids(account_ids)
+    send_delay_min, send_delay_max = _recipient_delay_window(delay_min, delay_max)
+    message = text.strip()
+    if not message:
+        raise HTTPException(400, "Nội dung tin nhắn không được để trống")
+    parsed = await _read_recipient_upload(file)
+    recipients: list[Recipient] = parsed["recipients"]
+    accounts = await _accounts_named(db, sender_ids)
+    active_count = sum(manager.get(aid) is not None for aid, _phone, _name in accounts)
+    if not accounts:
+        raise HTTPException(400, "Không tìm thấy tài khoản gửi đã chọn")
+    if not active_count:
+        raise HTTPException(409, "Không có tài khoản gửi nào đang kết nối")
+    return StreamingResponse(
+        _recipient_list_stream(
+            accounts, recipients, message, send_delay_min, send_delay_max
+        ),
+        media_type="application/x-ndjson",
+    )
+
+
+@router.post("/react")
+async def react(body: ReactIn, db: AsyncSession = Depends(get_db)):
+    try:
+        chan, msg_id = _parse_post_link(body.post_link)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    # Flatten assignments into a per-account reaction map (later assignment wins
+    # on overlap). Value is (display_glyph, custom_emoji_id_or_None).
+    react_by_id: dict[int, tuple[str, int | None]] = {}
+    for a in body.reactions:
+        for aid in a.account_ids:
+            react_by_id[aid] = (a.emoji, a.custom_emoji_id)
+    if not react_by_id:
+        raise HTTPException(400, "No accounts selected for any reaction")
+
+    accounts = await _accounts_named(db, list(react_by_id.keys()))
+
+    async def _react(cli, aid):
+        emoji, custom_id = react_by_id.get(aid, (None, None))
+        entity = await cli.get_entity(chan)
+        await cli(
+            SendReactionRequest(
+                peer=entity,
+                msg_id=msg_id,
+                reaction=[_reaction_obj(emoji, custom_id)],
+            )
+        )
+        return "ok", (f"{emoji} (custom)" if custom_id else emoji)
+
+    return StreamingResponse(
+        bulk_stream(accounts, _react), media_type="application/x-ndjson"
+    )
+
+
+@router.post("/allowed_reactions", response_model=AllowedReactionsOut)
+async def allowed_reactions(
+    body: AllowedReactionsIn, db: AsyncSession = Depends(get_db)
+):
+    """What reactions does this post's chat allow? Used to populate the reaction
+    picker so the user only chooses emoji that will actually work (admin-disabled
+    ones simply aren't offered)."""
+    try:
+        chan, _msg_id = _parse_post_link(body.post_link)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    # pick a client to query through
+    cli = manager.get(body.account_id) if body.account_id else None
+    if not cli:
+        clients = await manager.all_clients()
+        cli = next(iter(clients.values()), None)
+    if not cli:
+        raise HTTPException(409, "No connected account to read reactions with")
+
+    try:
+        entity = await cli.get_entity(chan)
+        avail = None
+        try:
+            full = await cli(GetFullChannelRequest(entity))
+            avail = getattr(full.full_chat, "available_reactions", None)
+        except Exception:
+            avail = None
+
+        if isinstance(avail, ChatReactionsNone):
+            return AllowedReactionsOut(mode="none")
+
+        if isinstance(avail, ChatReactionsSome):
+            standard: list[str] = []
+            custom_ids: list[int] = []
+            for r in avail.reactions:
+                if isinstance(r, ReactionEmoji):
+                    standard.append(r.emoticon)
+                elif isinstance(r, ReactionCustomEmoji):
+                    custom_ids.append(r.document_id)
+            custom = await _resolve_custom(cli, custom_ids)
+            return AllowedReactionsOut(mode="some", standard=standard, custom=custom)
+
+        # ChatReactionsAll or None -> all standard reactions allowed
+        allow_custom = (
+            bool(getattr(avail, "allow_custom", False)) if avail is not None else False
+        )
+        standard = await _global_standard_reactions(cli)
+        return AllowedReactionsOut(
+            mode="all", allow_custom=allow_custom, standard=standard
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, friendly_error(e))
+
+
+async def _global_standard_reactions(cli) -> list[str]:
+    try:
+        res = await cli(GetAvailableReactionsRequest(hash=0))
+        out = []
+        for r in getattr(res, "reactions", []):
+            if getattr(r, "inactive", False):
+                continue
+            emo = getattr(r, "reaction", None)
+            if emo:
+                out.append(emo)
+        return out
+    except Exception:
+        return []
+
+
+async def _resolve_custom(cli, ids: list[int]) -> list[AllowedCustomReaction]:
+    if not ids:
+        return []
+    out: list[AllowedCustomReaction] = []
+    try:
+        docs = await cli(GetCustomEmojiDocumentsRequest(document_id=ids))
+        for d in docs:
+            alt = ""
+            for attr in getattr(d, "attributes", []) or []:
+                if isinstance(attr, DocumentAttributeCustomEmoji):
+                    alt = attr.alt or ""
+                    break
+            out.append(AllowedCustomReaction(id=d.id, alt=alt))
+    except Exception:
+        # if we can't resolve alts, still return ids with a generic glyph
+        out = [AllowedCustomReaction(id=i, alt="⭐") for i in ids]
+    return out
+
+
+@router.post("/view")
+async def view(body: ViewPostIn, db: AsyncSession = Depends(get_db)):
+    try:
+        chan, msg_id = _parse_post_link(body.post_link)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    accounts = await _accounts_named(db, body.account_ids)
+
+    async def _view(cli, aid):
+        entity = await cli.get_entity(chan)
+        r = await cli(GetMessagesViewsRequest(peer=entity, id=[msg_id], increment=True))
+        n = r.views[0].views if (r and r.views) else None
+        return "ok", (f"{n} views" if n is not None else "")
+
+    return StreamingResponse(
+        bulk_stream(accounts, _view), media_type="application/x-ndjson"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Telegram-like chat panel (Profile tab): open a chat by @username / t.me link,
+# read recent history, send messages, and fire bot referral /start links.
+# ---------------------------------------------------------------------------
+
+
+def _parse_chat_input(raw: str) -> tuple[str, str | None]:
+    """Parse what the user pasted into (peer, start_param).
+
+    Handles: '@user', bare 'user', 'https://t.me/user', 't.me/user?start=PAY',
+    'tg://resolve?domain=user&start=PAY'. Raises ValueError for invite links
+    (t.me/+hash or t.me/joinchat/HASH), which require joining first."""
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("Enter a username or link")
+
+    # tg://resolve?domain=foo&start=bar
+    if s.lower().startswith("tg://resolve"):
+        q = parse_qs(urlparse(s).query)
+        dom = (q.get("domain") or [""])[0]
+        if not dom:
+            raise ValueError("Invalid tg:// link")
+        return dom, (q.get("start") or [None])[0]
+
+    body = s
+    for pre in ("https://", "http://"):
+        if body.lower().startswith(pre):
+            body = body[len(pre) :]
+            break
+
+    low = body.lower()
+    if low.startswith("t.me/") or low.startswith("telegram.me/"):
+        rest = body.split("/", 1)[1]
+        if rest.startswith("+") or rest.lower().startswith("joinchat/"):
+            raise ValueError(
+                "That's an invite link — join it from the Groups tab first, "
+                "then open it here by @username."
+            )
+        path, _, query = rest.partition("?")
+        seg = path.split("/")[0]
+        if not seg:
+            raise ValueError("Invalid t.me link")
+        start_param = (parse_qs(query).get("start") or [None])[0] if query else None
+        return seg, start_param
+
+    if s.startswith("@"):
+        return s[1:], None
+    return s, None
+
+
+def _coerce_peer(peer: str):
+    """get_entity accepts a username string or an int id. Numeric strings must
+    be cast to int or Telethon treats them as usernames."""
+    p = (peer or "").strip()
+    if re.fullmatch(r"-?\d+", p):
+        return int(p)
+    return p
+
+
+def _peer_info(entity) -> dict:
+    if isinstance(entity, User):
+        name = (f"{entity.first_name or ''} {entity.last_name or ''}").strip() or (
+            entity.username or str(entity.id)
+        )
+        kind = "bot" if getattr(entity, "bot", False) else "user"
+    elif isinstance(entity, Channel):
+        name = entity.title or (entity.username or str(entity.id))
+        kind = "channel" if getattr(entity, "broadcast", False) else "group"
+    elif isinstance(entity, Chat):
+        name = entity.title or str(entity.id)
+        kind = "group"
+    else:
+        name = str(getattr(entity, "id", "")) or "chat"
+        kind = "unknown"
+    username = getattr(entity, "username", None)
+    return {
+        "id": entity.id,
+        "ref": username or str(entity.id),
+        "title": name,
+        "username": username,
+        "kind": kind,
+        "is_bot": bool(getattr(entity, "bot", False)),
+    }
+
+
+def _media_label(msg) -> str | None:
+    media = getattr(msg, "media", None)
+    if media is None:
+        return None
+    t = type(media).__name__
+    if "Photo" in t:
+        return "[photo]"
+    if "Document" in t:
+        doc = getattr(media, "document", None)
+        mime = getattr(doc, "mime_type", "") or ""
+        if "image" in mime:
+            return "[sticker/image]"
+        if "video" in mime:
+            return "[video]"
+        if "audio" in mime:
+            return "[audio]"
+        return "[file]"
+    if "WebPage" in t:
+        return None  # link preview — the URL is already in the text
+    if "Poll" in t:
+        return "[poll]"
+    if "Geo" in t:
+        return "[location]"
+    if "Contact" in t:
+        return "[contact]"
+    return "[media]"
+
+
+def _msg_to_dict(msg) -> dict:
+    text = getattr(msg, "message", None) or ""
+    date = getattr(msg, "date", None)
+    return {
+        "id": getattr(msg, "id", 0),
+        "out": bool(getattr(msg, "out", False)),
+        "text": text,
+        "media": _media_label(msg) if not text else None,
+        "date": date.isoformat() if date else None,
+        "service": bool(getattr(msg, "action", None)),
+        "sender_id": getattr(msg, "sender_id", None),
+    }
+
+
+async def _history(cli, entity, limit: int = 40) -> list[dict]:
+    out: list[dict] = []
+    async for m in cli.iter_messages(entity, limit=max(1, min(limit, 100))):
+        out.append(_msg_to_dict(m))
+    out.reverse()  # oldest-first for natural top-to-bottom display
+    return out
+
+
+async def _has_any_message(cli, entity) -> bool:
+    async for _m in cli.iter_messages(entity, limit=1):
+        return True
+    return False
+
+
+async def _has_dialog(cli, entity) -> bool:
+    target_id = getattr(entity, "id", None)
+    target_username = (getattr(entity, "username", None) or "").lower()
+    async for dialog in cli.iter_dialogs():
+        e = dialog.entity
+        if target_id is not None and getattr(e, "id", None) == target_id:
+            return True
+        if (
+            target_username
+            and (getattr(e, "username", None) or "").lower() == target_username
+        ):
+            return True
+    return False
+
+
+async def _target_usage_for_client(cli, target: str) -> dict:
+    peer_ref, _ = _parse_chat_input(target)
+    entity = await cli.get_entity(_coerce_peer(peer_ref))
+    peer = _peer_info(entity)
+
+    if isinstance(entity, User):
+        has_messages = await _has_any_message(cli, entity)
+        label = "bot" if getattr(entity, "bot", False) else "user"
+        return {
+            "status": "present" if has_messages else "absent",
+            "detail": f"has messages with this {label}"
+            if has_messages
+            else f"no messages with this {label}",
+            "peer": peer,
+        }
+
+    if isinstance(entity, (Channel, Chat)):
+        joined = await _has_dialog(cli, entity)
+        label = peer.get("kind") or "chat"
+        return {
+            "status": "present" if joined else "absent",
+            "detail": f"joined/open in dialogs ({label})"
+            if joined
+            else f"not joined/opened ({label})",
+            "peer": peer,
+        }
+
+    has_messages = await _has_any_message(cli, entity)
+    return {
+        "status": "present" if has_messages else "absent",
+        "detail": "has messages" if has_messages else "no messages found",
+        "peer": peer,
+    }
+
+
+@router.post("/target_check")
+async def target_check(body: TargetUsageCheckIn, db: AsyncSession = Depends(get_db)):
+    target = (body.target or "").strip()
+    if not target:
+        raise HTTPException(400, "Enter a bot, channel, group, or user username")
+    try:
+        _parse_chat_input(target)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    accounts = await _all_accounts_named(db)
+    conc = max(1, int(getattr(settings, "CONCURRENCY", 8) or 8))
+    sem = asyncio.Semaphore(conc)
+    peer: dict | None = None
+
+    async def _one(aid: int, phone: str, name: str):
+        nonlocal peer
+        async with sem:
+            cli = manager.get(aid)
+            if not cli:
+                return {
+                    "id": aid,
+                    "phone": phone,
+                    "name": name,
+                    "status": "skipped",
+                    "detail": "not connected",
+                }
+            try:
+                checked = await _target_usage_for_client(cli, target)
+                if peer is None:
+                    peer = checked.get("peer")
+                return {
+                    "id": aid,
+                    "phone": phone,
+                    "name": name,
+                    "status": checked["status"],
+                    "detail": checked["detail"],
+                }
+            except Exception as e:
+                return {
+                    "id": aid,
+                    "phone": phone,
+                    "name": name,
+                    "status": "failed",
+                    "detail": friendly_error(e),
+                }
+
+    results = await asyncio.gather(
+        *(_one(aid, phone, name) for aid, phone, name in accounts)
+    )
+    return {
+        "target": target,
+        "peer": peer,
+        "total": len(results),
+        "present": [r for r in results if r["status"] == "present"],
+        "absent": [r for r in results if r["status"] == "absent"],
+        "skipped": [r for r in results if r["status"] == "skipped"],
+        "failed": [r for r in results if r["status"] == "failed"],
+        "results": results,
+    }
+
+
+@router.post("/{account_id}/open")
+async def open_chat(account_id: int, body: OpenChatIn):
+    """Resolve a chat by @username / t.me link, optionally fire a bot referral
+    /start, and return the peer info + recent history."""
+    cli = manager.get(account_id)
+    if not cli:
+        raise HTTPException(409, "Account not connected")
+    try:
+        peer_ref, start_param = _parse_chat_input(body.input)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    try:
+        entity = await cli.get_entity(_coerce_peer(peer_ref))
+        started = False
+        if start_param and getattr(entity, "bot", False):
+            try:
+                await cli(
+                    StartBotRequest(bot=entity, peer=entity, start_param=start_param)
+                )
+            except Exception:
+                # Fall back to a plain "/start <payload>" — the same payload still
+                # reaches the bot (e.g. if StartBot is rejected for an already-started bot).
+                await cli.send_message(entity, f"/start {start_param}")
+            started = True
+            await asyncio.sleep(1.0)  # let the bot reply before we read history
+        peer = _peer_info(entity)
+        msgs = await _history(cli, entity, body.limit)
+        return {
+            "peer": peer,
+            "started": started,
+            "start_param": start_param,
+            "messages": msgs,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, friendly_error(e))
+
+
+@router.get("/{account_id}/history")
+async def chat_history(account_id: int, peer: str, limit: int = 40):
+    cli = manager.get(account_id)
+    if not cli:
+        raise HTTPException(409, "Account not connected")
+    try:
+        entity = await cli.get_entity(_coerce_peer(peer))
+        return {"messages": await _history(cli, entity, limit)}
+    except Exception as e:
+        raise HTTPException(400, friendly_error(e))
+
+
+@router.post("/{account_id}/chat_send")
+async def chat_send(account_id: int, body: ChatSendIn):
+    cli = manager.get(account_id)
+    if not cli:
+        raise HTTPException(409, "Account not connected")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Message is empty")
+    try:
+        entity = await cli.get_entity(_coerce_peer(body.peer))
+        sent = await cli.send_message(entity, text)
+        return {"ok": True, "message": _msg_to_dict(sent)}
+    except Exception as e:
+        raise HTTPException(400, friendly_error(e))
+
+
+# ---------------------------------------------------------------------------
+# Bulk wipe a whole conversation by @username / t.me link: from every selected
+# account, delete the ENTIRE chat with that user — history is cleared for both
+# sides (revoke=True) and the dialog is removed, so the chat ceases to exist.
+# ---------------------------------------------------------------------------
+
+
+async def _wipe_chat_for_client(cli, target: str) -> tuple[str, str]:
+    """Resolve `target` to a peer and delete the whole conversation with it.
+
+    delete_dialog(revoke=True) issues messages.DeleteHistory(revoke=True) for a
+    user/bot peer, which removes every message for BOTH sides and drops the
+    dialog. Accounts that never had a chat with the user are reported as a soft
+    'skipped' rather than a misleading success.
+    """
+    peer_ref, _ = _parse_chat_input(target)
+    entity = await cli.get_entity(_coerce_peer(peer_ref))
+
+    # Cheap existence probe so a no-op wipe isn't reported as a real delete.
+    had: bool | None = False
+    try:
+        async for _m in cli.iter_messages(entity, limit=1):
+            had = True
+            break
+    except Exception:
+        had = None  # couldn't read — don't claim anything either way
+
+    async def _do():
+        await cli.delete_dialog(entity, revoke=True)
+
+    try:
+        await _do()
+    except FloodWaitError as fw:
+        if fw.seconds <= 30:
+            await asyncio.sleep(fw.seconds + 1)
+            await _do()
+        else:
+            raise
+
+    if had is False:
+        return "skipped", "no chat with this user — nothing to wipe"
+    return "ok", "chat wiped (deleted for both sides)"
+
+
+@router.post("/bulk_wipe_chat")
+async def bulk_wipe_chat(body: BulkWipeChatIn, db: AsyncSession = Depends(get_db)):
+    if not body.confirm:
+        raise HTTPException(400, "Explicit confirmation is required")
+    accounts = await _accounts_named(db, body.account_ids)
+    target = body.target
+    return StreamingResponse(
+        bulk_stream(accounts, lambda cli, aid: _wipe_chat_for_client(cli, target)),
+        media_type="application/x-ndjson",
+    )

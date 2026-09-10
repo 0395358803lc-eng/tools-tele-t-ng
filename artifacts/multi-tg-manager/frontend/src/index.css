@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light dark;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Neo-brutalism primitives */
+@layer components {
+  .nb-card {
+    @apply bg-white dark:bg-zinc-900 border-2 border-black dark:border-white shadow-nb dark:shadow-nbdark rounded-none;
+  }
+  .nb-card-sm {
+    @apply bg-white dark:bg-zinc-900 border-2 border-black dark:border-white shadow-nbsm dark:shadow-nbdarksm rounded-none;
+  }
+  /* Colored "stat" card whose background color is preserved in dark mode. */
+  .nb-stat {
+    @apply border-2 border-black dark:border-white shadow-nb dark:shadow-nbdark rounded-none text-black;
+  }
+  .nb-stat-sm {
+    @apply border-2 border-black dark:border-white shadow-nbsm dark:shadow-nbdarksm rounded-none text-black;
+  }
+  .nb-btn {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-2 font-bold uppercase tracking-tight text-sm
+           bg-white dark:bg-zinc-900 text-black dark:text-white
+           border-2 border-black dark:border-white
+           shadow-nbsm dark:shadow-nbdarksm hover:shadow-none hover:translate-x-[2px] hover:translate-y-[2px]
+           transition-all duration-100 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:translate-x-0 disabled:hover:translate-y-0 disabled:hover:shadow-nbsm disabled:dark:hover:shadow-nbdarksm;
+  }
+  .nb-btn-pri {
+    @apply nb-btn bg-brand-pri text-black border-black dark:border-black hover:bg-yellow-300;
+  }
+  .nb-btn-ok    { @apply nb-btn bg-brand-ok    text-black border-black dark:border-black; }
+  .nb-btn-warn  { @apply nb-btn bg-brand-warn  text-black border-black dark:border-black; }
+  .nb-btn-err   { @apply nb-btn bg-brand-err   text-black border-black dark:border-black; }
+  .nb-btn-info  { @apply nb-btn bg-brand-info  text-black border-black dark:border-black; }
+  .nb-input {
+    @apply w-full bg-white dark:bg-zinc-900 text-black dark:text-white
+           border-2 border-black dark:border-white px-3 py-2 font-mono text-sm
+           focus:outline-none focus:shadow-nbsm dark:focus:shadow-nbdarksm transition-shadow;
+  }
+  .nb-badge {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 text-xs font-bold uppercase tracking-tight
+           border-2 border-black dark:border-white;
+  }
+  .nb-tab {
+    @apply px-4 py-2 font-bold uppercase tracking-tight text-sm border-2 border-black dark:border-white
+           bg-white dark:bg-zinc-900 cursor-pointer select-none;
+  }
+  .nb-tab-active {
+    @apply bg-brand-pri text-black shadow-nbsm dark:shadow-nbdarksm -translate-y-[2px] -translate-x-[2px];
+  }
+}
+
+/* scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.3); border-radius: 0; }
+.dark ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); }

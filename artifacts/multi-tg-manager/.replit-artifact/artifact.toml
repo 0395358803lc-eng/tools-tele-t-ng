@@ -1,0 +1,33 @@
+kind = "web"
+previewPath = "/"
+title = "Multi TG Manager"
+description = "A private dashboard for managing owned Telegram accounts, profiles, groups, messages, and security actions from one screen."
+version = "1.0.0"
+id = "artifacts/multi-tg-manager"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18942
+
+[services.development]
+run = "pnpm --filter @workspace/multi-tg-manager run dev"
+
+[services.production]
+
+[services.production.build]
+args = ["pnpm", "--filter", "@workspace/multi-tg-manager", "run", "build"]
+
+[services.production.build.env]
+NODE_ENV = "production"
+
+[services.production.run]
+args = ["bash", "artifacts/multi-tg-manager/run-production.sh"]
+
+[services.production.run.env]
+PORT = "18942"
+NODE_ENV = "production"
+
+[services.production.health.startup]
+path = "/api/readiness"

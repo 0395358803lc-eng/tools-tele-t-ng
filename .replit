@@ -1,0 +1,46 @@
+modules = ["nodejs-24", "python-base-3.13", "postgresql-16"]
+
+[deployment]
+router = "application"
+deploymentTarget = "vm"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start Multi TG Manager"
+
+[[workflows.workflow]]
+name = "Start Multi TG Manager"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd artifacts/multi-tg-manager && if curl -fsS http://127.0.0.1:18942/api/health >/dev/null 2>&1; then echo App already running on port 18942; while curl -fsS http://127.0.0.1:18942/api/health >/dev/null 2>&1; do sleep 30; done; else PORT=18942 bash run-production.sh; fi"
+waitForPort = 18942
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[nix]
+channel = "stable-25_05"
+packages = ["cargo", "libiconv", "libxcrypt", "openssl", "postgresql", "rustc"]
