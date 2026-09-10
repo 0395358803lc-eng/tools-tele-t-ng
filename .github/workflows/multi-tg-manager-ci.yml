@@ -1,0 +1,47 @@
+name: Multi TG Manager CI
+
+on:
+  push:
+    paths:
+      - 'artifacts/multi-tg-manager/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/multi-tg-manager-ci.yml'
+  pull_request:
+    paths:
+      - 'artifacts/multi-tg-manager/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+      - name: Install Python dependencies
+        run: uv sync --group dev
+      - name: Python lint
+        working-directory: artifacts/multi-tg-manager/backend
+        run: uv run --project ../../.. ruff check app tests alembic migrate.py --select E,F,I --ignore E501
+      - name: Python tests
+        working-directory: artifacts/multi-tg-manager/backend
+        run: uv run --project ../../.. python -m unittest discover -s tests -v
+      - name: Shell syntax
+        run: bash -n artifacts/multi-tg-manager/run-production.sh artifacts/multi-tg-manager/ops/*.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: artifacts/multi-tg-manager/frontend/package-lock.json
+      - name: Frontend install
+        working-directory: artifacts/multi-tg-manager/frontend
+        run: npm ci
+      - name: Frontend production build
+        working-directory: artifacts/multi-tg-manager/frontend
+        run: npm run build
+      - name: Alembic revision graph
+        working-directory: artifacts/multi-tg-manager/backend
+        run: uv run --project ../../.. alembic heads
