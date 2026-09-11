@@ -1,0 +1,62 @@
+# Credentials — never commit
+.env
+.env.*
+!.env.example
+
+# Telegram session files (contain auth secrets)
+*.session
+*.session-journal
+
+# SQLite database files
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Output / logs
+logs/
+results/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Frontend (web UI)
+node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Test / cache
+__pycache__/
+**/*.py[cod]
+.pytest_cache/
+**.pyc
+
+# JetBrains IDEs
+.idea/
+
+# Images downloaded
+*.jpg
+*.jpeg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Security scan temp
+/scan_output.txt
+
+# TypeScript build output for Vite config
+web/vite.config.js
+web/vite.config.d.ts
+
+# Local deployment bootstrap / agent tooling — never publish
+telegram_phone_number_checker/shared_database_url.enc
+.agents/
+skills-lock.json
+
+# Codespaces/local toolchain state
+.config/
+
+.server/

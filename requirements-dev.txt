@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
+black==26.5.1
+isort==9.0.1
